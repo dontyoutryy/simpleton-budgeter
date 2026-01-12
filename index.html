@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simple Budget</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, deleteDoc, doc, onSnapshot, updateDoc, setDoc, query, orderBy } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+        let currentUser = null;
+        let transactions = [];
+        let bills = [];
+        let settings = { startingBalance: 0 };
+        let currentTab = 'transactions'; // 'transactions' or 'bills'
+
+        // --- Auth & Init ---
+        const initAuth = async () => {
+            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                await signInWithCustomToken(auth, __initial_auth_token);
+            } else {
+                await signInAnonymously(auth);
+            }
+        };
+
+        initAuth();
+
+        onAuthStateChanged(auth, (user) => {
+            if (user) {
+                currentUser = user;
+                document.getElementById('loading-screen').classList.add('hidden');
+                document.getElementById('app-content').classList.remove('hidden');
+                setupListeners(user.uid);
+            }
+        });
+
+        // --- Firestore Listeners ---
+        function setupListeners(userId) {
+            // Listen to Settings (Starting Balance)
+            const settingsRef = doc(db, 'artifacts', appId, 'users', userId, 'data', 'settings');
+            onSnapshot(settingsRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    settings = docSnap.data();
+                    document.getElementById('start-balance-input').value = settings.startingBalance;
+                } else {
+                    // Initialize if not exists
+                    setDoc(settingsRef, { startingBalance: 0 });
+                }
+                updateDashboard();
+            }, (error) => console.error("Settings error", error));
+
+            // Listen to Transactions
+            const txQuery = query(collection(db, 'artifacts', appId, 'users', userId, 'transactions')); 
+            // Note: client-side sorting used due to strict query index rules in prompt
+            
+            onSnapshot(txQuery, (snapshot) => {
+                transactions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                // Sort by date (descending) in memory
+                transactions.sort((a, b) => new Date(b.date) - new Date(a.date));
+                updateDashboard();
+                renderTransactions();
+            }, (error) => console.error("Tx error", error));
+
+            // Listen to Recurring Bills
+            const billsQuery = collection(db, 'artifacts', appId, 'users', userId, 'bills');
+            onSnapshot(billsQuery, (snapshot) => {
+                bills = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                renderBills();
+            }, (error) => console.error("Bills error", error));
+        }
+
+        // --- Core Logic ---
+        
+        // Update Starting Balance
+        window.updateStartingBalance = async (val) => {
+            if (!currentUser) return;
+            const amount = parseFloat(val) || 0;
+            const settingsRef = doc(db, 'artifacts', appId, 'users', currentUser.uid, 'data', 'settings');
+            await setDoc(settingsRef, { startingBalance: amount }, { merge: true });
+        };
+
+        // Add Transaction
+        window.addTransaction = async (e) => {
+            e.preventDefault();
+            if (!currentUser) return;
+            
+            const desc = document.getElementById('tx-desc').value;
+            const amount = parseFloat(document.getElementById('tx-amount').value);
+            const type = document.getElementById('tx-type').value;
+            const date = document.getElementById('tx-date').value || new Date().toISOString().split('T')[0];
+
+            if (!desc || isNaN(amount)) return;
+
+            await addDoc(collection(db, 'artifacts', appId, 'users', currentUser.uid, 'transactions'), {
+                description: desc,
+                amount: amount,
+                type: type,
+                date: date,
+                createdAt: new Date().toISOString()
+            });
+
+            // Reset form
+            document.getElementById('tx-form').reset();
+            // Set date back to today
+            document.getElementById('tx-date').valueAsDate = new Date();
+        };
+
+        // Add Recurring Bill
+        window.addBill = async (e) => {
+            e.preventDefault();
+            if (!currentUser) return;
+
+            const name = document.getElementById('bill-name').value;
+            const amount = parseFloat(document.getElementById('bill-amount').value);
+            const freq = document.getElementById('bill-freq').value;
+
+            if (!name || isNaN(amount)) return;
+
+            await addDoc(collection(db, 'artifacts', appId, 'users', currentUser.uid, 'bills'), {
+                name: name,
+                amount: amount,
+                frequency: freq,
+                createdAt: new Date().toISOString()
+            });
+
+            document.getElementById('bill-form').reset();
+        };
+
+        // Delete Items
+        window.deleteItem = async (collectionName, id) => {
+            if (!currentUser || !confirm('Are you sure you want to delete this?')) return;
+            await deleteDoc(doc(db, 'artifacts', appId, 'users', currentUser.uid, collectionName, id));
+        };
+
+        // Pay Bill (Convert Bill to Transaction)
+        window.payBill = async (name, amount) => {
+            if (!currentUser) return;
+            const date = new Date().toISOString().split('T')[0];
+            await addDoc(collection(db, 'artifacts', appId, 'users', currentUser.uid, 'transactions'), {
+                description: `Bill: ${name}`,
+                amount: amount,
+                type: 'expense',
+                date: date,
+                createdAt: new Date().toISOString()
+            });
+            // Switch to transaction tab to see it
+            switchTab('transactions');
+            // Optional: flash success
+            showToast(`Paid ${name} $${amount}`);
+        };
+
+        // --- UI Functions ---
+
+        function updateDashboard() {
+            const startBal = parseFloat(settings.startingBalance) || 0;
+            
+            const totalIncome = transactions
+                .filter(t => t.type === 'income')
+                .reduce((sum, t) => sum + (parseFloat(t.amount) || 0), 0);
+            
+            const totalExpense = transactions
+                .filter(t => t.type === 'expense')
+                .reduce((sum, t) => sum + (parseFloat(t.amount) || 0), 0);
+
+            const currentBal = startBal + totalIncome - totalExpense;
+
+            document.getElementById('display-balance').innerText = `$${currentBal.toFixed(2)}`;
+            document.getElementById('display-income').innerText = `+$${totalIncome.toFixed(2)}`;
+            document.getElementById('display-expense').innerText = `-$${totalExpense.toFixed(2)}`;
+            
+            // Color logic for balance
+            const balEl = document.getElementById('display-balance');
+            if (currentBal < 0) {
+                balEl.classList.remove('text-gray-900');
+                balEl.classList.add('text-red-600');
+            } else {
+                balEl.classList.remove('text-red-600');
+                balEl.classList.add('text-gray-900');
+            }
+        }
+
+        function renderTransactions() {
+            const container = document.getElementById('tx-list');
+            container.innerHTML = '';
+
+            if (transactions.length === 0) {
+                container.innerHTML = `<div class="text-center text-gray-400 py-8">No transactions yet. Add one above!</div>`;
+                return;
+            }
+
+            transactions.forEach(tx => {
+                const isExpense = tx.type === 'expense';
+                const sign = isExpense ? '-' : '+';
+                const color = isExpense ? 'text-red-600' : 'text-green-600';
+                const bg = isExpense ? 'bg-red-50' : 'bg-green-50';
+                const icon = isExpense ? 'fa-arrow-trend-down' : 'fa-arrow-trend-up';
+
+                const el = document.createElement('div');
+                el.className = `flex items-center justify-between p-3 rounded-lg border border-gray-100 hover:bg-gray-50 transition-colors mb-2 bg-white shadow-sm`;
+                el.innerHTML = `
+                    <div class="flex items-center gap-3">
+                        <div class="w-10 h-10 rounded-full ${bg} ${color} flex items-center justify-center shrink-0">
+                            <i class="fa-solid ${icon}"></i>
+                        </div>
+                        <div>
+                            <div class="font-medium text-gray-800">${tx.description}</div>
+                            <div class="text-xs text-gray-400">${tx.date}</div>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-3">
+                        <span class="font-bold ${color}">${sign}$${parseFloat(tx.amount).toFixed(2)}</span>
+                        <button onclick="deleteItem('transactions', '${tx.id}')" class="text-gray-300 hover:text-red-500 transition-colors">
+                            <i class="fa-solid fa-trash"></i>
+                        </button>
+                    </div>
+                `;
+                container.appendChild(el);
+            });
+        }
+
+        function renderBills() {
+            const container = document.getElementById('bill-list');
+            container.innerHTML = '';
+
+            if (bills.length === 0) {
+                container.innerHTML = `<div class="text-center text-gray-400 py-8">No recurring bills set up.</div>`;
+                return;
+            }
+
+            bills.forEach(bill => {
+                const el = document.createElement('div');
+                el.className = `flex flex-col sm:flex-row sm:items-center justify-between p-4 rounded-lg border border-gray-200 bg-white shadow-sm mb-3`;
+                el.innerHTML = `
+                    <div class="flex items-center gap-3 mb-3 sm:mb-0">
+                        <div class="w-10 h-10 rounded-full bg-blue-50 text-blue-600 flex items-center justify-center shrink-0">
+                            <i class="fa-solid fa-calendar-check"></i>
+                        </div>
+                        <div>
+                            <div class="font-bold text-gray-800">${bill.name}</div>
+                            <div class="text-xs text-gray-500 uppercase tracking-wide bg-gray-100 px-2 py-0.5 rounded inline-block mt-1">${bill.frequency}</div>
+                        </div>
+                    </div>
+                    <div class="flex items-center justify-between sm:justify-end gap-4 w-full sm:w-auto">
+                        <span class="font-bold text-gray-900 text-lg">$${parseFloat(bill.amount).toFixed(2)}</span>
+                        <div class="flex gap-2">
+                            <button onclick="payBill('${bill.name}', ${bill.amount})" class="px-3 py-1.5 bg-green-100 text-green-700 rounded-md hover:bg-green-200 text-sm font-medium transition-colors">
+                                Pay Now
+                            </button>
+                            <button onclick="deleteItem('bills', '${bill.id}')" class="p-2 text-gray-300 hover:text-red-500 transition-colors">
+                                <i class="fa-solid fa-trash"></i>
+                            </button>
+                        </div>
+                    </div>
+                `;
+                container.appendChild(el);
+            });
+        }
+
+        window.switchTab = (tab) => {
+            currentTab = tab;
+            
+            // UI Toggle
+            document.getElementById('tab-btn-tx').className = tab === 'transactions' 
+                ? 'flex-1 py-2 text-center font-medium text-blue-600 border-b-2 border-blue-600'
+                : 'flex-1 py-2 text-center font-medium text-gray-500 hover:text-gray-700';
+            
+            document.getElementById('tab-btn-bills').className = tab === 'bills'
+                ? 'flex-1 py-2 text-center font-medium text-blue-600 border-b-2 border-blue-600'
+                : 'flex-1 py-2 text-center font-medium text-gray-500 hover:text-gray-700';
+
+            // Content Toggle
+            document.getElementById('view-transactions').classList.toggle('hidden', tab !== 'transactions');
+            document.getElementById('view-bills').classList.toggle('hidden', tab !== 'bills');
+        }
+
+        // Init default date
+        window.addEventListener('DOMContentLoaded', () => {
+            const dateInput = document.getElementById('tx-date');
+            if(dateInput) dateInput.valueAsDate = new Date();
+        });
+
+        // Simple Toast
+        function showToast(msg) {
+            const toast = document.createElement('div');
+            toast.className = 'fixed bottom-4 right-4 bg-gray-800 text-white px-4 py-2 rounded shadow-lg transform transition-all duration-500 translate-y-0 opacity-100 z-50';
+            toast.innerText = msg;
+            document.body.appendChild(toast);
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                toast.style.transform = 'translateY(20px)';
+                setTimeout(() => toast.remove(), 500);
+            }, 3000);
+        }
+
+    </script>
+</head>
+<body class="bg-gray-50 text-gray-800 font-sans h-screen overflow-hidden flex flex-col">
+
+    <!-- Loading Screen -->
+    <div id="loading-screen" class="fixed inset-0 bg-white z-50 flex flex-col items-center justify-center">
+        <i class="fa-solid fa-circle-notch fa-spin text-4xl text-blue-500 mb-4"></i>
+        <p class="text-gray-500">Loading your budget...</p>
+    </div>
+
+    <!-- App Content -->
+    <div id="app-content" class="hidden flex-1 flex flex-col max-w-md mx-auto w-full h-full bg-white shadow-xl sm:rounded-xl sm:my-4 sm:h-[95vh] relative overflow-hidden">
+        
+        <!-- Header / Dashboard -->
+        <header class="bg-gradient-to-r from-blue-600 to-blue-700 text-white p-6 pb-8 shrink-0 relative">
+            <h1 class="text-lg font-light opacity-90 mb-1">Current Balance</h1>
+            <div id="display-balance" class="text-4xl font-bold mb-4 tracking-tight">$0.00</div>
+            
+            <div class="grid grid-cols-2 gap-4">
+                <div class="bg-white/10 rounded-lg p-2 backdrop-blur-sm">
+                    <div class="text-xs opacity-75">Income</div>
+                    <div id="display-income" class="font-bold text-green-300 text-lg">+$0.00</div>
+                </div>
+                <div class="bg-white/10 rounded-lg p-2 backdrop-blur-sm">
+                    <div class="text-xs opacity-75">Expenses</div>
+                    <div id="display-expense" class="font-bold text-red-200 text-lg">-$0.00</div>
+                </div>
+            </div>
+
+            <!-- Start Balance Input Overlay -->
+            <div class="absolute -bottom-6 left-6 right-6 bg-white rounded-lg shadow-md p-3 flex items-center justify-between border border-gray-100">
+                <span class="text-xs font-bold text-gray-500 uppercase">Starting Balance</span>
+                <div class="flex items-center">
+                    <span class="text-gray-400 mr-1">$</span>
+                    <input type="number" id="start-balance-input" onchange="updateStartingBalance(this.value)" class="w-24 text-right font-bold text-gray-800 outline-none border-b border-transparent focus:border-blue-500 transition-colors" placeholder="0.00">
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Body -->
+        <div class="flex-1 overflow-hidden flex flex-col pt-8">
+            
+            <!-- Tabs -->
+            <div class="flex border-b border-gray-100 shrink-0 px-4">
+                <button id="tab-btn-tx" onclick="switchTab('transactions')" class="flex-1 py-2 text-center font-medium text-blue-600 border-b-2 border-blue-600">
+                    Transactions
+                </button>
+                <button id="tab-btn-bills" onclick="switchTab('bills')" class="flex-1 py-2 text-center font-medium text-gray-500 hover:text-gray-700">
+                    Recurring Bills
+                </button>
+            </div>
+
+            <!-- View: Transactions -->
+            <div id="view-transactions" class="flex-1 flex flex-col overflow-hidden">
+                <!-- Add Form -->
+                <form id="tx-form" onsubmit="addTransaction(event)" class="p-4 bg-gray-50 border-b border-gray-100 shrink-0">
+                    <div class="flex gap-2 mb-2">
+                        <select id="tx-type" class="p-2 rounded border border-gray-300 text-sm focus:border-blue-500 outline-none bg-white">
+                            <option value="expense">Expense</option>
+                            <option value="income">Income</option>
+                        </select>
+                        <input type="number" step="0.01" id="tx-amount" placeholder="Amount" class="flex-1 p-2 rounded border border-gray-300 text-sm focus:border-blue-500 outline-none" required>
+                    </div>
+                    <div class="flex gap-2">
+                        <input type="text" id="tx-desc" placeholder="Description (e.g. Tacos)" class="flex-1 p-2 rounded border border-gray-300 text-sm focus:border-blue-500 outline-none" required>
+                        <input type="date" id="tx-date" class="w-28 p-2 rounded border border-gray-300 text-sm focus:border-blue-500 outline-none text-gray-500">
+                        <button type="submit" class="bg-blue-600 text-white w-10 rounded hover:bg-blue-700 flex items-center justify-center transition-colors">
+                            <i class="fa-solid fa-plus"></i>
+                        </button>
+                    </div>
+                </form>
+
+                <!-- List -->
+                <div id="tx-list" class="flex-1 overflow-y-auto p-4 space-y-2">
+                    <!-- Transactions injected here -->
+                </div>
+            </div>
+
+            <!-- View: Bills -->
+            <div id="view-bills" class="hidden flex-1 flex flex-col overflow-hidden">
+                <!-- Add Form -->
+                <form id="bill-form" onsubmit="addBill(event)" class="p-4 bg-gray-50 border-b border-gray-100 shrink-0">
+                    <div class="text-xs font-bold text-gray-400 uppercase mb-2">Add New Recurring Bill</div>
+                    <div class="flex gap-2 mb-2">
+                        <input type="text" id="bill-name" placeholder="Bill Name (e.g. Netflix)" class="flex-1 p-2 rounded border border-gray-300 text-sm focus:border-blue-500 outline-none" required>
+                        <input type="number" step="0.01" id="bill-amount" placeholder="Amount" class="w-24 p-2 rounded border border-gray-300 text-sm focus:border-blue-500 outline-none" required>
+                    </div>
+                    <div class="flex gap-2">
+                        <select id="bill-freq" class="flex-1 p-2 rounded border border-gray-300 text-sm focus:border-blue-500 outline-none bg-white">
+                            <option value="Monthly">Monthly</option>
+                            <option value="Weekly">Weekly</option>
+                            <option value="Yearly">Yearly</option>
+                        </select>
+                        <button type="submit" class="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700 text-sm font-medium transition-colors">
+                            Add Bill
+                        </button>
+                    </div>
+                </form>
+
+                <!-- List -->
+                <div id="bill-list" class="flex-1 overflow-y-auto p-4">
+                    <!-- Bills injected here -->
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
