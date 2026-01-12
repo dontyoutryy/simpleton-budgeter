@@ -3,84 +3,149 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Simple Budget</title>
+    <title>Simpleton Budgeter</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <script type="module">
-        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, addDoc, deleteDoc, doc, onSnapshot, updateDoc, setDoc, query, orderBy } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+  // Import the functions you need from the SDKs you need
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/12.7.0/firebase-app.js";
+  import { getAnalytics } from "https://www.gstatic.com/firebasejs/12.7.0/firebase-analytics.js";
+  // TODO: Add SDKs for Firebase products that you want to use
+  // https://firebase.google.com/docs/web/setup#available-libraries
 
-        const firebaseConfig = JSON.parse(__firebase_config);
-        const app = initializeApp(firebaseConfig);
-        const auth = getAuth(app);
-        const db = getFirestore(app);
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+  // Your web app's Firebase configuration
+  // For Firebase JS SDK v7.20.0 and later, measurementId is optional
+  const firebaseConfig = {
+    apiKey: "AIzaSyDw3zueDw_lhlDzAoWi2k2-eIm1W2hACpg",
+    authDomain: "simpleton-systems.firebaseapp.com",
+    projectId: "simpleton-systems",
+    storageBucket: "simpleton-systems.firebasestorage.app",
+    messagingSenderId: "767895291692",
+    appId: "1:767895291692:web:0e6f83d1e9c09c58488e89",
+    measurementId: "G-JLKMDWTJ84"
+  };
 
+  // Initialize Firebase
+  const app = initializeApp(firebaseConfig);
+  const analytics = getAnalytics(app);
+
+        // --- State ---
         let currentUser = null;
         let transactions = [];
         let bills = [];
         let settings = { startingBalance: 0 };
-        let currentTab = 'transactions'; // 'transactions' or 'bills'
+        let currentTab = 'transactions';
+        let unsubscribeSettings = null;
+        let unsubscribeTx = null;
+        let unsubscribeBills = null;
 
-        // --- Auth & Init ---
+        // --- Auth Logic ---
         const initAuth = async () => {
-            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-                await signInWithCustomToken(auth, __initial_auth_token);
-            } else {
-                await signInAnonymously(auth);
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Auth Failed:", error);
+                alert("Authentication failed. Please refresh.");
             }
         };
 
+        // Start Auth process immediately in background
         initAuth();
 
+        // Listen for Auth Changes
         onAuthStateChanged(auth, (user) => {
             if (user) {
                 currentUser = user;
-                document.getElementById('loading-screen').classList.add('hidden');
-                document.getElementById('app-content').classList.remove('hidden');
+                console.log("User Authenticated:", user.uid);
+                
+                // Update UI if we are waiting on the login screen
+                const loginBtn = document.getElementById('login-btn');
+                if (loginBtn) {
+                    loginBtn.innerHTML = '<i class="fa-solid fa-arrow-right mr-2"></i> Enter Budget';
+                    loginBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                    loginBtn.disabled = false;
+                }
+                
+                // Setup Realtime Listeners
                 setupListeners(user.uid);
+                
+                // Update User Profile UI
+                document.getElementById('user-id-display').innerText = `ID: ${user.uid.substring(0, 6)}...`;
+            } else {
+                currentUser = null;
+                cleanupListeners();
+                showLoginScreen();
             }
         });
 
-        // --- Firestore Listeners ---
+        // --- Data Listeners ---
         function setupListeners(userId) {
-            // Listen to Settings (Starting Balance)
+            // 1. Settings (Balance)
             const settingsRef = doc(db, 'artifacts', appId, 'users', userId, 'data', 'settings');
-            onSnapshot(settingsRef, (docSnap) => {
+            unsubscribeSettings = onSnapshot(settingsRef, (docSnap) => {
                 if (docSnap.exists()) {
                     settings = docSnap.data();
                     document.getElementById('start-balance-input').value = settings.startingBalance;
                 } else {
-                    // Initialize if not exists
                     setDoc(settingsRef, { startingBalance: 0 });
                 }
                 updateDashboard();
-            }, (error) => console.error("Settings error", error));
+            }, (error) => console.error("Settings Error:", error));
 
-            // Listen to Transactions
-            const txQuery = query(collection(db, 'artifacts', appId, 'users', userId, 'transactions')); 
-            // Note: client-side sorting used due to strict query index rules in prompt
-            
-            onSnapshot(txQuery, (snapshot) => {
+            // 2. Transactions
+            // Note: We fetch all and sort in memory to avoid index requirements
+            const txQuery = collection(db, 'artifacts', appId, 'users', userId, 'transactions');
+            unsubscribeTx = onSnapshot(txQuery, (snapshot) => {
                 transactions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                // Sort by date (descending) in memory
+                // Sort by date descending
                 transactions.sort((a, b) => new Date(b.date) - new Date(a.date));
+                
                 updateDashboard();
                 renderTransactions();
-            }, (error) => console.error("Tx error", error));
+            }, (error) => console.error("Transactions Error:", error));
 
-            // Listen to Recurring Bills
+            // 3. Bills
             const billsQuery = collection(db, 'artifacts', appId, 'users', userId, 'bills');
-            onSnapshot(billsQuery, (snapshot) => {
+            unsubscribeBills = onSnapshot(billsQuery, (snapshot) => {
                 bills = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                 renderBills();
-            }, (error) => console.error("Bills error", error));
+            }, (error) => console.error("Bills Error:", error));
         }
 
-        // --- Core Logic ---
-        
-        // Update Starting Balance
+        function cleanupListeners() {
+            if (unsubscribeSettings) unsubscribeSettings();
+            if (unsubscribeTx) unsubscribeTx();
+            if (unsubscribeBills) unsubscribeBills();
+        }
+
+        // --- UI Navigation ---
+        window.enterApp = () => {
+            if (!currentUser) {
+                // If clicked before auth is ready (rare), show loading
+                document.getElementById('login-btn').innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> Connecting...';
+                return;
+            }
+            document.getElementById('login-screen').classList.add('hidden');
+            document.getElementById('app-content').classList.remove('hidden');
+        };
+
+        function showLoginScreen() {
+            document.getElementById('login-screen').classList.remove('hidden');
+            document.getElementById('app-content').classList.add('hidden');
+        }
+
+        window.handleLogout = async () => {
+            // In this specific environment, true signout is tricky because the token might be re-injected.
+            // We simulate it by reloading to reset state or showing the login screen.
+            location.reload(); 
+        };
+
+        // --- Core App Logic ---
+
         window.updateStartingBalance = async (val) => {
             if (!currentUser) return;
             const amount = parseFloat(val) || 0;
@@ -88,33 +153,41 @@
             await setDoc(settingsRef, { startingBalance: amount }, { merge: true });
         };
 
-        // Add Transaction
         window.addTransaction = async (e) => {
             e.preventDefault();
             if (!currentUser) return;
             
-            const desc = document.getElementById('tx-desc').value;
-            const amount = parseFloat(document.getElementById('tx-amount').value);
-            const type = document.getElementById('tx-type').value;
-            const date = document.getElementById('tx-date').value || new Date().toISOString().split('T')[0];
+            const btn = e.target.querySelector('button[type="submit"]');
+            const originalText = btn.innerHTML;
+            btn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i>';
+            btn.disabled = true;
 
-            if (!desc || isNaN(amount)) return;
+            try {
+                const desc = document.getElementById('tx-desc').value;
+                const amount = parseFloat(document.getElementById('tx-amount').value);
+                const type = document.getElementById('tx-type').value;
+                const date = document.getElementById('tx-date').value || new Date().toISOString().split('T')[0];
 
-            await addDoc(collection(db, 'artifacts', appId, 'users', currentUser.uid, 'transactions'), {
-                description: desc,
-                amount: amount,
-                type: type,
-                date: date,
-                createdAt: new Date().toISOString()
-            });
+                if (!desc || isNaN(amount)) throw new Error("Invalid Input");
 
-            // Reset form
-            document.getElementById('tx-form').reset();
-            // Set date back to today
-            document.getElementById('tx-date').valueAsDate = new Date();
+                await addDoc(collection(db, 'artifacts', appId, 'users', currentUser.uid, 'transactions'), {
+                    description: desc,
+                    amount: amount,
+                    type: type,
+                    date: date,
+                    createdAt: new Date().toISOString()
+                });
+
+                document.getElementById('tx-form').reset();
+                document.getElementById('tx-date').valueAsDate = new Date();
+            } catch (err) {
+                console.error(err);
+            } finally {
+                btn.innerHTML = originalText;
+                btn.disabled = false;
+            }
         };
 
-        // Add Recurring Bill
         window.addBill = async (e) => {
             e.preventDefault();
             if (!currentUser) return;
@@ -135,16 +208,16 @@
             document.getElementById('bill-form').reset();
         };
 
-        // Delete Items
         window.deleteItem = async (collectionName, id) => {
-            if (!currentUser || !confirm('Are you sure you want to delete this?')) return;
+            if (!currentUser || !confirm('Delete this item?')) return;
             await deleteDoc(doc(db, 'artifacts', appId, 'users', currentUser.uid, collectionName, id));
         };
 
-        // Pay Bill (Convert Bill to Transaction)
         window.payBill = async (name, amount) => {
             if (!currentUser) return;
             const date = new Date().toISOString().split('T')[0];
+            
+            // Create expense transaction
             await addDoc(collection(db, 'artifacts', appId, 'users', currentUser.uid, 'transactions'), {
                 description: `Bill: ${name}`,
                 amount: amount,
@@ -152,13 +225,12 @@
                 date: date,
                 createdAt: new Date().toISOString()
             });
-            // Switch to transaction tab to see it
-            switchTab('transactions');
-            // Optional: flash success
+
             showToast(`Paid ${name} $${amount}`);
+            switchTab('transactions');
         };
 
-        // --- UI Functions ---
+        // --- UI Rendering ---
 
         function updateDashboard() {
             const startBal = parseFloat(settings.startingBalance) || 0;
@@ -173,19 +245,13 @@
 
             const currentBal = startBal + totalIncome - totalExpense;
 
+            // Animate Numbers (Simple)
             document.getElementById('display-balance').innerText = `$${currentBal.toFixed(2)}`;
             document.getElementById('display-income').innerText = `+$${totalIncome.toFixed(2)}`;
             document.getElementById('display-expense').innerText = `-$${totalExpense.toFixed(2)}`;
             
-            // Color logic for balance
             const balEl = document.getElementById('display-balance');
-            if (currentBal < 0) {
-                balEl.classList.remove('text-gray-900');
-                balEl.classList.add('text-red-600');
-            } else {
-                balEl.classList.remove('text-red-600');
-                balEl.classList.add('text-gray-900');
-            }
+            balEl.className = `text-4xl font-bold mb-4 tracking-tight transition-colors duration-300 ${currentBal < 0 ? 'text-red-200' : 'text-white'}`;
         }
 
         function renderTransactions() {
@@ -193,22 +259,26 @@
             container.innerHTML = '';
 
             if (transactions.length === 0) {
-                container.innerHTML = `<div class="text-center text-gray-400 py-8">No transactions yet. Add one above!</div>`;
+                container.innerHTML = `
+                    <div class="flex flex-col items-center justify-center h-48 text-gray-400">
+                        <i class="fa-solid fa-receipt text-3xl mb-2 opacity-50"></i>
+                        <p>No transactions yet</p>
+                    </div>`;
                 return;
             }
 
             transactions.forEach(tx => {
                 const isExpense = tx.type === 'expense';
                 const sign = isExpense ? '-' : '+';
-                const color = isExpense ? 'text-red-600' : 'text-green-600';
-                const bg = isExpense ? 'bg-red-50' : 'bg-green-50';
+                const colorClass = isExpense ? 'text-red-600' : 'text-green-600';
+                const bgClass = isExpense ? 'bg-red-50' : 'bg-green-50';
                 const icon = isExpense ? 'fa-arrow-trend-down' : 'fa-arrow-trend-up';
 
                 const el = document.createElement('div');
-                el.className = `flex items-center justify-between p-3 rounded-lg border border-gray-100 hover:bg-gray-50 transition-colors mb-2 bg-white shadow-sm`;
+                el.className = `group flex items-center justify-between p-3 rounded-lg border border-gray-100 hover:border-blue-200 hover:shadow-md transition-all mb-2 bg-white`;
                 el.innerHTML = `
                     <div class="flex items-center gap-3">
-                        <div class="w-10 h-10 rounded-full ${bg} ${color} flex items-center justify-center shrink-0">
+                        <div class="w-10 h-10 rounded-full ${bgClass} ${colorClass} flex items-center justify-center shrink-0">
                             <i class="fa-solid ${icon}"></i>
                         </div>
                         <div>
@@ -217,9 +287,9 @@
                         </div>
                     </div>
                     <div class="flex items-center gap-3">
-                        <span class="font-bold ${color}">${sign}$${parseFloat(tx.amount).toFixed(2)}</span>
-                        <button onclick="deleteItem('transactions', '${tx.id}')" class="text-gray-300 hover:text-red-500 transition-colors">
-                            <i class="fa-solid fa-trash"></i>
+                        <span class="font-bold ${colorClass}">${sign}$${parseFloat(tx.amount).toFixed(2)}</span>
+                        <button onclick="deleteItem('transactions', '${tx.id}')" class="opacity-0 group-hover:opacity-100 w-8 h-8 flex items-center justify-center rounded-full hover:bg-red-50 text-gray-300 hover:text-red-500 transition-all">
+                            <i class="fa-solid fa-trash text-sm"></i>
                         </button>
                     </div>
                 `;
@@ -232,17 +302,21 @@
             container.innerHTML = '';
 
             if (bills.length === 0) {
-                container.innerHTML = `<div class="text-center text-gray-400 py-8">No recurring bills set up.</div>`;
+                container.innerHTML = `
+                    <div class="flex flex-col items-center justify-center h-48 text-gray-400">
+                        <i class="fa-solid fa-calendar text-3xl mb-2 opacity-50"></i>
+                        <p>No bills set up</p>
+                    </div>`;
                 return;
             }
 
             bills.forEach(bill => {
                 const el = document.createElement('div');
-                el.className = `flex flex-col sm:flex-row sm:items-center justify-between p-4 rounded-lg border border-gray-200 bg-white shadow-sm mb-3`;
+                el.className = `group flex flex-col sm:flex-row sm:items-center justify-between p-4 rounded-lg border border-gray-200 bg-white hover:shadow-md transition-all mb-3`;
                 el.innerHTML = `
                     <div class="flex items-center gap-3 mb-3 sm:mb-0">
-                        <div class="w-10 h-10 rounded-full bg-blue-50 text-blue-600 flex items-center justify-center shrink-0">
-                            <i class="fa-solid fa-calendar-check"></i>
+                        <div class="w-10 h-10 rounded-full bg-indigo-50 text-indigo-600 flex items-center justify-center shrink-0">
+                            <i class="fa-solid fa-file-invoice-dollar"></i>
                         </div>
                         <div>
                             <div class="font-bold text-gray-800">${bill.name}</div>
@@ -252,11 +326,11 @@
                     <div class="flex items-center justify-between sm:justify-end gap-4 w-full sm:w-auto">
                         <span class="font-bold text-gray-900 text-lg">$${parseFloat(bill.amount).toFixed(2)}</span>
                         <div class="flex gap-2">
-                            <button onclick="payBill('${bill.name}', ${bill.amount})" class="px-3 py-1.5 bg-green-100 text-green-700 rounded-md hover:bg-green-200 text-sm font-medium transition-colors">
-                                Pay Now
+                            <button onclick="payBill('${bill.name}', ${bill.amount})" class="px-3 py-1.5 bg-green-100 text-green-700 rounded hover:bg-green-200 text-sm font-medium transition-colors flex items-center gap-1">
+                                <i class="fa-solid fa-check"></i> Pay
                             </button>
-                            <button onclick="deleteItem('bills', '${bill.id}')" class="p-2 text-gray-300 hover:text-red-500 transition-colors">
-                                <i class="fa-solid fa-trash"></i>
+                            <button onclick="deleteItem('bills', '${bill.id}')" class="w-8 h-8 flex items-center justify-center rounded-full hover:bg-red-50 text-gray-300 hover:text-red-500 transition-colors">
+                                <i class="fa-solid fa-trash text-sm"></i>
                             </button>
                         </div>
                     </div>
@@ -268,87 +342,131 @@
         window.switchTab = (tab) => {
             currentTab = tab;
             
-            // UI Toggle
-            document.getElementById('tab-btn-tx').className = tab === 'transactions' 
-                ? 'flex-1 py-2 text-center font-medium text-blue-600 border-b-2 border-blue-600'
-                : 'flex-1 py-2 text-center font-medium text-gray-500 hover:text-gray-700';
+            const btnTx = document.getElementById('tab-btn-tx');
+            const btnBills = document.getElementById('tab-btn-bills');
             
-            document.getElementById('tab-btn-bills').className = tab === 'bills'
-                ? 'flex-1 py-2 text-center font-medium text-blue-600 border-b-2 border-blue-600'
-                : 'flex-1 py-2 text-center font-medium text-gray-500 hover:text-gray-700';
+            if (tab === 'transactions') {
+                btnTx.className = 'flex-1 py-3 text-center font-medium text-blue-600 border-b-2 border-blue-600 bg-blue-50/50';
+                btnBills.className = 'flex-1 py-3 text-center font-medium text-gray-500 hover:text-gray-700 hover:bg-gray-50';
+            } else {
+                btnTx.className = 'flex-1 py-3 text-center font-medium text-gray-500 hover:text-gray-700 hover:bg-gray-50';
+                btnBills.className = 'flex-1 py-3 text-center font-medium text-blue-600 border-b-2 border-blue-600 bg-blue-50/50';
+            }
 
-            // Content Toggle
             document.getElementById('view-transactions').classList.toggle('hidden', tab !== 'transactions');
             document.getElementById('view-bills').classList.toggle('hidden', tab !== 'bills');
-        }
+        };
 
-        // Init default date
+        window.showToast = (msg) => {
+            const toast = document.createElement('div');
+            toast.className = 'fixed bottom-4 right-4 bg-gray-800 text-white px-4 py-3 rounded-lg shadow-xl transform transition-all duration-500 translate-y-10 opacity-0 z-50 flex items-center gap-3';
+            toast.innerHTML = `<i class="fa-solid fa-circle-check text-green-400"></i> <span>${msg}</span>`;
+            document.body.appendChild(toast);
+            
+            // Trigger animation
+            requestAnimationFrame(() => {
+                toast.classList.remove('translate-y-10', 'opacity-0');
+            });
+
+            setTimeout(() => {
+                toast.classList.add('translate-y-10', 'opacity-0');
+                setTimeout(() => toast.remove(), 500);
+            }, 3000);
+        };
+
+        // Init UI
         window.addEventListener('DOMContentLoaded', () => {
             const dateInput = document.getElementById('tx-date');
             if(dateInput) dateInput.valueAsDate = new Date();
         });
 
-        // Simple Toast
-        function showToast(msg) {
-            const toast = document.createElement('div');
-            toast.className = 'fixed bottom-4 right-4 bg-gray-800 text-white px-4 py-2 rounded shadow-lg transform transition-all duration-500 translate-y-0 opacity-100 z-50';
-            toast.innerText = msg;
-            document.body.appendChild(toast);
-            setTimeout(() => {
-                toast.style.opacity = '0';
-                toast.style.transform = 'translateY(20px)';
-                setTimeout(() => toast.remove(), 500);
-            }, 3000);
-        }
-
     </script>
 </head>
-<body class="bg-gray-50 text-gray-800 font-sans h-screen overflow-hidden flex flex-col">
+<body class="bg-slate-100 text-gray-800 font-sans h-screen overflow-hidden flex flex-col">
 
-    <!-- Loading Screen -->
-    <div id="loading-screen" class="fixed inset-0 bg-white z-50 flex flex-col items-center justify-center">
-        <i class="fa-solid fa-circle-notch fa-spin text-4xl text-blue-500 mb-4"></i>
-        <p class="text-gray-500">Loading your budget...</p>
+    <!-- 1. Login/Landing Screen -->
+    <div id="login-screen" class="fixed inset-0 bg-slate-100 z-50 flex flex-col items-center justify-center p-6 transition-all duration-500">
+        <div class="max-w-sm w-full bg-white rounded-2xl shadow-xl p-8 text-center space-y-6">
+            <div class="w-20 h-20 bg-blue-600 rounded-2xl mx-auto flex items-center justify-center shadow-lg shadow-blue-200">
+                <i class="fa-solid fa-wallet text-3xl text-white"></i>
+            </div>
+            <div>
+                <h1 class="text-2xl font-bold text-gray-900">Simple Budget</h1>
+                <p class="text-gray-500 mt-2">Track expenses & recurring bills securely in the cloud.</p>
+            </div>
+            
+            <button id="login-btn" onclick="enterApp()" disabled class="w-full py-3 px-4 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-all transform hover:scale-[1.02] active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center">
+                <i class="fa-solid fa-circle-notch fa-spin mr-2"></i> Connecting...
+            </button>
+            
+            <p class="text-xs text-gray-400">Secured by Firebase • Private Data</p>
+        </div>
     </div>
 
-    <!-- App Content -->
-    <div id="app-content" class="hidden flex-1 flex flex-col max-w-md mx-auto w-full h-full bg-white shadow-xl sm:rounded-xl sm:my-4 sm:h-[95vh] relative overflow-hidden">
+    <!-- 2. Main App Content -->
+    <div id="app-content" class="hidden flex-1 flex flex-col max-w-lg mx-auto w-full h-full bg-white shadow-2xl sm:rounded-xl sm:my-4 sm:h-[95vh] relative overflow-hidden transition-opacity duration-500">
         
-        <!-- Header / Dashboard -->
-        <header class="bg-gradient-to-r from-blue-600 to-blue-700 text-white p-6 pb-8 shrink-0 relative">
-            <h1 class="text-lg font-light opacity-90 mb-1">Current Balance</h1>
-            <div id="display-balance" class="text-4xl font-bold mb-4 tracking-tight">$0.00</div>
+        <!-- Header -->
+        <header class="bg-gradient-to-br from-blue-600 to-indigo-700 text-white p-6 pb-8 shrink-0 relative shadow-lg">
+            <div class="flex justify-between items-start mb-6">
+                <h1 class="font-medium opacity-90 flex items-center gap-2">
+                    <i class="fa-solid fa-wallet"></i> My Wallet
+                </h1>
+                <div class="flex items-center gap-3">
+                    <div class="text-right">
+                        <div class="text-[10px] uppercase opacity-75 font-bold tracking-wider">Account</div>
+                        <div id="user-id-display" class="text-xs font-mono bg-white/10 px-2 py-0.5 rounded">...</div>
+                    </div>
+                    <button onclick="handleLogout()" class="w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center transition-colors" title="Logout">
+                        <i class="fa-solid fa-right-from-bracket text-xs"></i>
+                    </button>
+                </div>
+            </div>
+
+            <div class="text-center">
+                <h2 class="text-sm font-light opacity-80 mb-1">Total Balance</h2>
+                <div id="display-balance" class="text-4xl font-bold mb-6 tracking-tight transition-colors">$0.00</div>
+            </div>
             
             <div class="grid grid-cols-2 gap-4">
-                <div class="bg-white/10 rounded-lg p-2 backdrop-blur-sm">
-                    <div class="text-xs opacity-75">Income</div>
-                    <div id="display-income" class="font-bold text-green-300 text-lg">+$0.00</div>
+                <div class="bg-white/10 rounded-xl p-3 backdrop-blur-sm border border-white/10">
+                    <div class="flex items-center gap-2 mb-1">
+                        <div class="w-2 h-2 rounded-full bg-green-400"></div>
+                        <div class="text-xs opacity-75 font-medium">Income</div>
+                    </div>
+                    <div id="display-income" class="font-bold text-white text-lg tracking-wide">+$0.00</div>
                 </div>
-                <div class="bg-white/10 rounded-lg p-2 backdrop-blur-sm">
-                    <div class="text-xs opacity-75">Expenses</div>
-                    <div id="display-expense" class="font-bold text-red-200 text-lg">-$0.00</div>
+                <div class="bg-white/10 rounded-xl p-3 backdrop-blur-sm border border-white/10">
+                    <div class="flex items-center gap-2 mb-1">
+                        <div class="w-2 h-2 rounded-full bg-red-400"></div>
+                        <div class="text-xs opacity-75 font-medium">Expenses</div>
+                    </div>
+                    <div id="display-expense" class="font-bold text-white text-lg tracking-wide">-$0.00</div>
                 </div>
             </div>
 
             <!-- Start Balance Input Overlay -->
-            <div class="absolute -bottom-6 left-6 right-6 bg-white rounded-lg shadow-md p-3 flex items-center justify-between border border-gray-100">
-                <span class="text-xs font-bold text-gray-500 uppercase">Starting Balance</span>
-                <div class="flex items-center">
-                    <span class="text-gray-400 mr-1">$</span>
-                    <input type="number" id="start-balance-input" onchange="updateStartingBalance(this.value)" class="w-24 text-right font-bold text-gray-800 outline-none border-b border-transparent focus:border-blue-500 transition-colors" placeholder="0.00">
+            <div class="absolute -bottom-6 left-6 right-6 bg-white rounded-xl shadow-lg p-4 flex items-center justify-between border border-gray-100 ring-1 ring-black/5">
+                <div class="flex items-center gap-2 text-gray-500">
+                    <i class="fa-solid fa-vault text-blue-500"></i>
+                    <span class="text-xs font-bold uppercase tracking-wide">Starting Balance</span>
+                </div>
+                <div class="flex items-center bg-gray-50 rounded px-2">
+                    <span class="text-gray-400 text-sm">$</span>
+                    <input type="number" id="start-balance-input" onchange="updateStartingBalance(this.value)" class="w-24 text-right font-bold text-gray-800 outline-none bg-transparent py-1 border-b border-transparent focus:border-blue-500 transition-colors" placeholder="0.00">
                 </div>
             </div>
         </header>
 
         <!-- Main Body -->
-        <div class="flex-1 overflow-hidden flex flex-col pt-8">
+        <div class="flex-1 overflow-hidden flex flex-col pt-10">
             
             <!-- Tabs -->
-            <div class="flex border-b border-gray-100 shrink-0 px-4">
-                <button id="tab-btn-tx" onclick="switchTab('transactions')" class="flex-1 py-2 text-center font-medium text-blue-600 border-b-2 border-blue-600">
+            <div class="flex border-b border-gray-100 shrink-0 px-6 gap-2">
+                <button id="tab-btn-tx" onclick="switchTab('transactions')" class="flex-1 py-3 text-center font-medium text-blue-600 border-b-2 border-blue-600 bg-blue-50/50 rounded-t-lg transition-colors">
                     Transactions
                 </button>
-                <button id="tab-btn-bills" onclick="switchTab('bills')" class="flex-1 py-2 text-center font-medium text-gray-500 hover:text-gray-700">
+                <button id="tab-btn-bills" onclick="switchTab('bills')" class="flex-1 py-3 text-center font-medium text-gray-500 hover:text-gray-700 hover:bg-gray-50 rounded-t-lg transition-colors">
                     Recurring Bills
                 </button>
             </div>
@@ -356,25 +474,25 @@
             <!-- View: Transactions -->
             <div id="view-transactions" class="flex-1 flex flex-col overflow-hidden">
                 <!-- Add Form -->
-                <form id="tx-form" onsubmit="addTransaction(event)" class="p-4 bg-gray-50 border-b border-gray-100 shrink-0">
-                    <div class="flex gap-2 mb-2">
-                        <select id="tx-type" class="p-2 rounded border border-gray-300 text-sm focus:border-blue-500 outline-none bg-white">
+                <form id="tx-form" onsubmit="addTransaction(event)" class="p-4 bg-gray-50/80 border-b border-gray-200 shrink-0">
+                    <div class="flex gap-2 mb-3">
+                        <select id="tx-type" class="p-2.5 rounded-lg border border-gray-300 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none bg-white">
                             <option value="expense">Expense</option>
                             <option value="income">Income</option>
                         </select>
-                        <input type="number" step="0.01" id="tx-amount" placeholder="Amount" class="flex-1 p-2 rounded border border-gray-300 text-sm focus:border-blue-500 outline-none" required>
+                        <input type="number" step="0.01" id="tx-amount" placeholder="Amount" class="flex-1 p-2.5 rounded-lg border border-gray-300 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none" required>
                     </div>
                     <div class="flex gap-2">
-                        <input type="text" id="tx-desc" placeholder="Description (e.g. Tacos)" class="flex-1 p-2 rounded border border-gray-300 text-sm focus:border-blue-500 outline-none" required>
-                        <input type="date" id="tx-date" class="w-28 p-2 rounded border border-gray-300 text-sm focus:border-blue-500 outline-none text-gray-500">
-                        <button type="submit" class="bg-blue-600 text-white w-10 rounded hover:bg-blue-700 flex items-center justify-center transition-colors">
+                        <input type="text" id="tx-desc" placeholder="Description (e.g. Groceries)" class="flex-1 p-2.5 rounded-lg border border-gray-300 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none" required>
+                        <input type="date" id="tx-date" class="w-10 p-2.5 rounded-lg border border-gray-300 text-sm focus:border-blue-500 outline-none text-transparent focus:text-gray-600 focus:w-32 transition-all relative z-10" title="Select Date">
+                        <button type="submit" class="bg-blue-600 text-white w-12 rounded-lg hover:bg-blue-700 shadow-sm flex items-center justify-center transition-all active:scale-95">
                             <i class="fa-solid fa-plus"></i>
                         </button>
                     </div>
                 </form>
 
                 <!-- List -->
-                <div id="tx-list" class="flex-1 overflow-y-auto p-4 space-y-2">
+                <div id="tx-list" class="flex-1 overflow-y-auto p-4 space-y-1 bg-white">
                     <!-- Transactions injected here -->
                 </div>
             </div>
@@ -382,26 +500,28 @@
             <!-- View: Bills -->
             <div id="view-bills" class="hidden flex-1 flex flex-col overflow-hidden">
                 <!-- Add Form -->
-                <form id="bill-form" onsubmit="addBill(event)" class="p-4 bg-gray-50 border-b border-gray-100 shrink-0">
-                    <div class="text-xs font-bold text-gray-400 uppercase mb-2">Add New Recurring Bill</div>
+                <form id="bill-form" onsubmit="addBill(event)" class="p-4 bg-indigo-50/50 border-b border-indigo-100 shrink-0">
+                    <div class="text-xs font-bold text-indigo-400 uppercase mb-2 flex items-center gap-1">
+                        <i class="fa-solid fa-plus-circle"></i> New Subscription / Bill
+                    </div>
                     <div class="flex gap-2 mb-2">
-                        <input type="text" id="bill-name" placeholder="Bill Name (e.g. Netflix)" class="flex-1 p-2 rounded border border-gray-300 text-sm focus:border-blue-500 outline-none" required>
-                        <input type="number" step="0.01" id="bill-amount" placeholder="Amount" class="w-24 p-2 rounded border border-gray-300 text-sm focus:border-blue-500 outline-none" required>
+                        <input type="text" id="bill-name" placeholder="Name (e.g. Netflix)" class="flex-1 p-2.5 rounded-lg border border-indigo-200 text-sm focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none" required>
+                        <input type="number" step="0.01" id="bill-amount" placeholder="Amount" class="w-24 p-2.5 rounded-lg border border-indigo-200 text-sm focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none" required>
                     </div>
                     <div class="flex gap-2">
-                        <select id="bill-freq" class="flex-1 p-2 rounded border border-gray-300 text-sm focus:border-blue-500 outline-none bg-white">
+                        <select id="bill-freq" class="flex-1 p-2.5 rounded-lg border border-indigo-200 text-sm focus:border-indigo-500 outline-none bg-white">
                             <option value="Monthly">Monthly</option>
                             <option value="Weekly">Weekly</option>
                             <option value="Yearly">Yearly</option>
                         </select>
-                        <button type="submit" class="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700 text-sm font-medium transition-colors">
+                        <button type="submit" class="bg-indigo-600 text-white px-6 py-2 rounded-lg hover:bg-indigo-700 text-sm font-medium shadow-sm transition-all active:scale-95">
                             Add Bill
                         </button>
                     </div>
                 </form>
 
                 <!-- List -->
-                <div id="bill-list" class="flex-1 overflow-y-auto p-4">
+                <div id="bill-list" class="flex-1 overflow-y-auto p-4 bg-slate-50">
                     <!-- Bills injected here -->
                 </div>
             </div>
